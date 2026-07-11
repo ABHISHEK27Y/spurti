@@ -5,14 +5,19 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-import { ALLOW_STUDENT_SEARCH, MONGO_URI, PORT, SAMAGAMA_AUTH_URL } from './config.js';
+import { ALLOW_STUDENT_SEARCH, MONGO_URI, PORT, SAMAGAMA_AUTH_URL, STREAK_FREEZE_COST_SP } from './config.js';
 import Student from './models/Student.js';
 import Session from './models/Session.js';
 import AttendanceRecord from './models/AttendanceRecord.js';
 import PollRecord from './models/PollRecord.js';
 import SPTransaction from './models/SPTransaction.js';
 import SessionEvent from './models/SessionEvent.js';
+import NotificationPreference from './models/NotificationPreference.js';
+import Notification from './models/Notification.js';
 import { leagueBand, levelFor, legendBadge, leaderboardGroup, groupLabel } from './services/levels.js';
+import { getOrCreatePreferences, notify } from './services/notifications.js';
+import { computeStreak } from './services/streaks.js';
+import { appendTransaction, logTransaction } from './services/spLedger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -20,51 +25,73 @@ const clientDist = path.join(rootDir, 'client', 'dist');
 const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL || 'dled@iitrpr.ac.in');
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'vled-local-admin';
 
-// Survey triangulation pop-up. All driven by env so the form link / mode can
+// Survey triangulation pop-up(s). All driven by env so the form link / mode can
 // change without a client rebuild (the client reads these via /api/config).
-const SURVEY = {
-  enabled: process.env.SURVEY_ENABLED === '1',
-  formUrl: process.env.SURVEY_FORM_URL || '',          // .../viewform  (the published form)
-  emailEntryId: process.env.SURVEY_EMAIL_ENTRY || '',  // e.g. entry.1234567890  (pre-fills email)
-  // Mandatory survey: 'hard' = blocking modal the student cannot dismiss until
-  // they submit. No SP reward — participation is required, not incentivised.
-  enforcement: process.env.SURVEY_ENFORCEMENT || 'hard',
-  // Auto-expiry. After this instant the modal stops showing (normal Spurti
-  // resumes) with no redeploy. ISO 8601 incl. offset, e.g. 2026-06-30T23:59:59+05:30.
-  deadline: process.env.SURVEY_DEADLINE || '',
-  webhookSecret: process.env.SURVEY_WEBHOOK_SECRET || '', // shared secret for the Apps Script webhook
-  // Apps Script web app that returns {emails:[...]} of actual submitters (private
-  // sheet; secret-gated). Used to verify completion without trusting the client.
-  responsesUrl: process.env.SURVEY_RESPONSES_URL || '',
-  responsesSecret: process.env.SURVEY_RESPONSES_SECRET || ''
-};
+// One config per pop-up; `completedField` is the Student flag it drives, so each
+// pop-up has an independent completion state. `SURVEY` is the original perception
+// survey; `POLL2` is a second, identical pop-up on its own flag.
+function makeSurvey(prefix, completedField) {
+  return {
+    key: completedField.replace(/Completed$/, ''),      // 'survey' | 'poll2'
+    completedField,                                      // Student boolean flag
+    completedAtField: completedField + 'At',             // Student timestamp field
+    enabled: process.env[`${prefix}_ENABLED`] === '1',
+    formUrl: process.env[`${prefix}_FORM_URL`] || '',          // .../viewform  (the published form)
+    emailEntryId: process.env[`${prefix}_EMAIL_ENTRY`] || '',  // e.g. entry.1234567890  (pre-fills email)
+    // Mandatory: 'hard' = blocking modal the student cannot dismiss until they
+    // submit. No SP reward — participation is required, not incentivised.
+    enforcement: process.env[`${prefix}_ENFORCEMENT`] || 'hard',
+    // Auto-expiry. After this instant the modal stops showing (normal Spurti
+    // resumes) with no redeploy. ISO 8601 incl. offset, e.g. 2026-06-30T23:59:59+05:30.
+    deadline: process.env[`${prefix}_DEADLINE`] || '',
+    webhookSecret: process.env[`${prefix}_WEBHOOK_SECRET`] || '', // shared secret for the Apps Script webhook
+    // Apps Script web app that returns {emails:[...]} of actual submitters (private
+    // sheet; secret-gated). Used to verify completion without trusting the client.
+    responsesUrl: process.env[`${prefix}_RESPONSES_URL`] || '',
+    responsesSecret: process.env[`${prefix}_RESPONSES_SECRET`] || '',
+    _subs: { at: 0, set: null }                          // per-survey 60s cache
+  };
+}
+const SURVEY = makeSurvey('SURVEY', 'surveyCompleted');
+const POLL2 = makeSurvey('POLL2', 'poll2Completed');
+const SURVEYS = [SURVEY, POLL2];
 
-// Cached fetch of the submitted-email set from the Apps Script endpoint.
-let _subs = { at: 0, set: null };
-async function getSubmittedEmails() {
-  if (!SURVEY.responsesUrl) return null;
-  if (_subs.set && Date.now() - _subs.at < 60000) return _subs.set;   // 60s cache
+// Cached fetch of the submitted-email set from a survey's Apps Script endpoint.
+async function getSubmittedEmails(cfg) {
+  if (!cfg.responsesUrl) return null;
+  if (cfg._subs.set && Date.now() - cfg._subs.at < 60000) return cfg._subs.set;   // 60s cache
   try {
-    const u = SURVEY.responsesUrl + (SURVEY.responsesUrl.includes('?') ? '&' : '?') +
-              'secret=' + encodeURIComponent(SURVEY.responsesSecret);
+    const u = cfg.responsesUrl + (cfg.responsesUrl.includes('?') ? '&' : '?') +
+              'secret=' + encodeURIComponent(cfg.responsesSecret);
     const r = await fetch(u, { redirect: 'follow' });
     const j = await r.json();
-    _subs = { at: Date.now(), set: new Set((j.emails || []).map(e => normalizeEmail(e))) };
-    return _subs.set;
+    cfg._subs = { at: Date.now(), set: new Set((j.emails || []).map(e => normalizeEmail(e))) };
+    return cfg._subs.set;
   } catch (err) {
-    console.error('survey responses fetch failed:', err?.message);
-    return _subs.set; // serve last good cache on failure
+    console.error(`${cfg.key} responses fetch failed:`, err?.message);
+    return cfg._subs.set; // serve last good cache on failure
   }
 }
 
-// The survey is active only while enabled AND before its deadline (if set).
-function surveyActive() {
-  if (!SURVEY.enabled) return false;
-  if (SURVEY.deadline) {
-    const cutoff = Date.parse(SURVEY.deadline);
+// A survey is active only while enabled AND before its deadline (if set).
+function surveyActive(cfg) {
+  if (!cfg.enabled) return false;
+  if (cfg.deadline) {
+    const cutoff = Date.parse(cfg.deadline);
     if (!Number.isNaN(cutoff) && Date.now() > cutoff) return false;
   }
   return true;
+}
+
+// The env-driven public view of a survey the client needs (form + mode + gate).
+function surveyPublic(cfg) {
+  return {
+    enabled: surveyActive(cfg),
+    formUrl: cfg.formUrl,
+    emailEntryId: cfg.emailEntryId,
+    enforcement: cfg.enforcement,
+    deadline: cfg.deadline
+  };
 }
 
 const app = express();
@@ -164,6 +191,7 @@ async function studentPayload(student) {
     Student.find(activeFilter).sort({ totalSp: -1, name: 1 }).limit(50).lean(),
     Student.find(activeFilter).sort({ totalSp: -1, name: 1 }).lean()
   ]);
+  const streak = computeStreak(attendance, student.streakProtectedSessions || []);
   const allSp = allStudents.map(s => Number(s.totalSp || 0));
   const averageSp = allSp.length ? Math.round(allSp.reduce((sum, value) => sum + value, 0) / allSp.length) : 0;
   const top10Cutoff = allStudents[9]?.totalSp || null;
@@ -202,11 +230,14 @@ async function studentPayload(student) {
       legendBadgeUnlocked: legendBadge(highestSpEver),
       leaderboardGroup: myGroup,
       leaderboardGroupLabel: groupLabel(myGroup),
-      surveyCompleted: Boolean(student.surveyCompleted)
+      surveyCompleted: Boolean(student.surveyCompleted),
+      poll2Completed: Boolean(student.poll2Completed),
+      streakFreezesAvailable: student.streakFreezesAvailable || 0
     },
     transactions,
     polls,
     attendance,
+    streak,
     cohort: {
       averageSp,
       top10Cutoff,
@@ -234,13 +265,8 @@ api.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 api.get('/config', (_req, res) => res.json({
   allowStudentSearch: ALLOW_STUDENT_SEARCH,
-  survey: {
-    enabled: surveyActive(),
-    formUrl: SURVEY.formUrl,
-    emailEntryId: SURVEY.emailEntryId,
-    enforcement: SURVEY.enforcement,
-    deadline: SURVEY.deadline
-  }
+  survey: surveyPublic(SURVEY),
+  poll2: surveyPublic(POLL2)
 }));
 
 api.get('/me', async (req, res) => {
@@ -248,8 +274,152 @@ api.get('/me', async (req, res) => {
   if (!email) return res.status(401).json({ authenticated: false });
   const student = await Student.findOne({ $or: [{ email }, { alternateEmail: email }] }).lean();
   if (!student) return res.status(404).json({ authenticated: false, error: 'Student not found' });
+  
+  await getOrCreatePreferences(email);
+
   if (student.status === 'excused') return res.json({ authenticated: true, ...excusedPayload(student) });
-  res.json({ authenticated: true, profile: await studentPayload(student) });
+  
+  const profile = await studentPayload(student);
+  let streak = profile.streak;
+  
+  if (!streak.isActive && streak.streakBrokenAt &&
+      streak.streakBrokenAt !== student.lastNotifiedStreakBreak &&
+      !(student.streakProtectedSessions || []).includes(streak.streakBrokenAt)) {
+
+    const claimed = await Student.findOneAndUpdate(
+      {
+        _id: student._id,
+        streakFreezesAvailable: { $gt: 0 },
+        streakProtectedSessions: { $ne: streak.streakBrokenAt }
+      },
+      {
+        $inc: { streakFreezesAvailable: -1 },
+        $addToSet: { streakProtectedSessions: streak.streakBrokenAt }
+      },
+      { new: true }
+    );
+
+    if (claimed) {
+      streak = computeStreak(profile.attendance, claimed.streakProtectedSessions);
+      profile.streak = streak;
+      profile.student.streakFreezesAvailable = claimed.streakFreezesAvailable;
+      notify(email, 'streakReminders', {
+        title: 'Streak freeze used',
+        message: `A streak freeze protected your streak after session ${streak.streakBrokenAt}. You have ${claimed.streakFreezesAvailable} left.`
+      }).catch(() => {});
+    } else {
+      const breakClaimed = await Student.findOneAndUpdate(
+        { _id: student._id, lastNotifiedStreakBreak: { $ne: streak.streakBrokenAt } },
+        { $set: { lastNotifiedStreakBreak: streak.streakBrokenAt } }
+      );
+      if (breakClaimed) {
+        notify(email, 'streakReminders', {
+          title: 'Streak broken',
+          message: `Your attendance streak ended after session ${streak.streakBrokenAt}. Time for a comeback!`
+        }).catch(() => {});
+      }
+    }
+  }
+
+  res.json({ authenticated: true, profile });
+});
+
+api.post('/streak-freeze/buy', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Not authenticated' });
+
+  const student = await Student.findOneAndUpdate(
+    { email, totalSp: { $gte: STREAK_FREEZE_COST_SP } },
+    { $inc: { totalSp: -STREAK_FREEZE_COST_SP, streakFreezesAvailable: 1 } },
+    { new: true }
+  );
+
+  if (!student) {
+    return res.status(400).json({ error: 'Not enough SP to buy a streak freeze' });
+  }
+
+  await logTransaction(
+    email,
+    'streakFreeze',
+    '',
+    new Date(),
+    -STREAK_FREEZE_COST_SP,
+    'Purchased a streak freeze',
+    student.totalSp
+  ).catch(() => {});
+
+  res.json({ streakFreezesAvailable: student.streakFreezesAvailable, totalSp: student.totalSp });
+});
+
+api.get('/notifications/preferences', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Unauthorized' });
+  const prefs = await getOrCreatePreferences(email);
+  res.json(prefs);
+});
+
+api.put('/notifications/preferences', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Unauthorized' });
+  
+  const { categories } = req.body;
+  if (!categories || typeof categories !== 'object') return res.status(400).json({ error: 'Invalid payload' });
+
+  const allowedCategories = ['weeklyDigest', 'streakReminders', 'peerActivity', 'announcements'];
+  const updateQuery = { $set: {} };
+
+  for (const cat of allowedCategories) {
+    if (categories[cat]) {
+      if (typeof categories[cat].inApp === 'boolean') {
+        updateQuery.$set[`categories.${cat}.inApp`] = categories[cat].inApp;
+      }
+      if (typeof categories[cat].email === 'boolean') {
+        updateQuery.$set[`categories.${cat}.email`] = categories[cat].email;
+      }
+    }
+  }
+
+  if (Object.keys(updateQuery.$set).length === 0) return res.status(400).json({ error: 'No valid preferences to update' });
+
+  const prefs = await NotificationPreference.findOneAndUpdate(
+    { email },
+    updateQuery,
+    { new: true }
+  );
+  res.json(prefs);
+});
+
+api.get('/notifications', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Unauthorized' });
+  
+  const limit = Math.min(Number(req.query.limit) || 20, 50);
+  const filter = { email };
+  if (req.query.before) filter.createdAt = { $lt: new Date(req.query.before) };
+
+  const notifications = await Notification.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+  res.json(notifications);
+});
+
+api.post('/notifications/:id/read', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Unauthorized' });
+
+  const notif = await Notification.findOneAndUpdate(
+    { _id: req.params.id, email },
+    { $set: { read: true } },
+    { new: true }
+  );
+  if (!notif) return res.status(404).json({ error: 'Notification not found' });
+  res.json(notif);
+});
+
+api.post('/notifications/read-all', async (req, res) => {
+  const email = await studentEmailFromRequest(req);
+  if (!email) return res.status(401).json({ error: 'Unauthorized' });
+
+  await Notification.updateMany({ email, read: false }, { $set: { read: true } });
+  res.json({ ok: true });
 });
 
 api.get('/search', async (req, res) => {
@@ -323,16 +493,16 @@ api.post('/ping', async (req, res) => {
 });
 
 // --- Survey triangulation (mandatory perception follow-up) ---------------
-// Mark a student's survey as completed. Idempotent; matches on primary or
-// alternate email. No SP is awarded — the survey is mandatory, not rewarded.
-async function markSurveyComplete(email) {
+// Mark a student's survey as completed for the given survey config. Idempotent;
+// matches on primary or alternate email. No SP is awarded — mandatory, not rewarded.
+async function markSurveyComplete(email, cfg) {
   const normalized = normalizeEmail(email);
   if (!normalized) return null;
   const student = await Student.findOne({ $or: [{ email: normalized }, { alternateEmail: normalized }] });
   if (!student) return null;
-  if (!student.surveyCompleted) {
-    student.surveyCompleted = true;
-    student.surveyCompletedAt = new Date();
+  if (!student[cfg.completedField]) {
+    student[cfg.completedField] = true;
+    student[cfg.completedAtField] = new Date();
     await student.save();
   }
   return student;
@@ -341,38 +511,44 @@ async function markSurveyComplete(email) {
 // NOTE: there is deliberately NO client-callable "mark complete" endpoint. The
 // flag is set ONLY by a real Google submission (the webhook below) or the
 // server-side sheet sync, so the modal cannot be dismissed by trust. The client
-// can only READ status via /survey/status and dismiss when it returns completed.
-
-// Completion check the modal polls and verifies on the "I've submitted" button.
-// Session-authenticated; reflects only server-set (webhook/sync) completion.
-api.get('/survey/status', async (req, res) => {
-  const email = await studentEmailFromRequest(req);
-  if (!email) return res.json({ completed: false });
-  const student = await Student.findOne({ $or: [{ email }, { alternateEmail: email }] }).lean();
-  if (student?.surveyCompleted) return res.json({ completed: true });
-  // On-demand verification against the responses sheet (so the "I've submitted"
-  // button confirms a genuine submission without waiting for the 10-min cron).
-  const subs = await getSubmittedEmails();
-  if (subs && student) {
-    const e = normalizeEmail(student.email), a = normalizeEmail(student.alternateEmail);
-    if (subs.has(e) || (a && subs.has(a))) {
-      await markSurveyComplete(student.email);
-      return res.json({ completed: true });
+// can only READ status via <base>/status and dismiss when it returns completed.
+//
+// Registers /<base>/status + /<base>/webhook for one survey config, so the
+// original survey and poll2 share identical, independent route logic.
+function registerSurveyRoutes(base, cfg) {
+  // Completion check the modal polls and verifies on the "I've submitted" button.
+  // Session-authenticated; reflects only server-set (webhook/sync) completion.
+  api.get(`${base}/status`, async (req, res) => {
+    const email = await studentEmailFromRequest(req);
+    if (!email) return res.json({ completed: false });
+    const student = await Student.findOne({ $or: [{ email }, { alternateEmail: email }] }).lean();
+    if (student?.[cfg.completedField]) return res.json({ completed: true });
+    // On-demand verification against the responses sheet (so the "I've submitted"
+    // button confirms a genuine submission without waiting for the 10-min cron).
+    const subs = await getSubmittedEmails(cfg);
+    if (subs && student) {
+      const e = normalizeEmail(student.email), a = normalizeEmail(student.alternateEmail);
+      if (subs.has(e) || (a && subs.has(a))) {
+        await markSurveyComplete(student.email, cfg);
+        return res.json({ completed: true });
+      }
     }
-  }
-  res.json({ completed: false });
-});
+    res.json({ completed: false });
+  });
 
-// Authoritative confirmation: the Google Form's Apps Script onFormSubmit
-// trigger POSTs { email, secret } here. Secret-authenticated, not session.
-api.post('/survey/webhook', async (req, res) => {
-  if (!SURVEY.webhookSecret || String(req.body?.secret || '') !== SURVEY.webhookSecret) {
-    return res.status(403).json({ ok: false, error: 'forbidden' });
-  }
-  const student = await markSurveyComplete(req.body?.email);
-  if (!student) return res.status(404).json({ ok: false, error: 'no match', email: normalizeEmail(req.body?.email) });
-  res.json({ ok: true, email: student.email });
-});
+  // Authoritative confirmation: the Google Form's Apps Script onFormSubmit
+  // trigger POSTs { email, secret } here. Secret-authenticated, not session.
+  api.post(`${base}/webhook`, async (req, res) => {
+    if (!cfg.webhookSecret || String(req.body?.secret || '') !== cfg.webhookSecret) {
+      return res.status(403).json({ ok: false, error: 'forbidden' });
+    }
+    const student = await markSurveyComplete(req.body?.email, cfg);
+    if (!student) return res.status(404).json({ ok: false, error: 'no match', email: normalizeEmail(req.body?.email) });
+    res.json({ ok: true, email: student.email });
+  });
+}
+registerSurveyRoutes('/survey', SURVEY);
+registerSurveyRoutes('/poll2', POLL2);
 
 api.get('/admin/stats', adminGuard, async (_req, res) => {
   const [yetToOnboard, excusedStudents, sessions, txns, activeStudents] = await Promise.all([
@@ -533,7 +709,7 @@ api.get('/admin/analytics', adminGuard, async (_req, res) => {
     };
   });
 
-  const categoryTotals = ['initial', 'attendance', 'poll', 'manual'].map(category => {
+  const categoryTotals = ['initial', 'attendance', 'poll', 'manual', 'streakFreeze'].map(category => {
     const rows = activeTransactions.filter(t => t.category === category);
     return {
       category,
